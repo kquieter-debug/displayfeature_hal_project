@@ -1,0 +1,9 @@
+rust_binary {
+    name: "vendor.xiaomi.hardware.displayfeature_aidl-service.tb375fc-rust",
+    vendor: true,
+    relative_install_path: "hw",
+    srcs: ["src/main.rs"],
+    init_rc: ["vendor.xiaomi.hardware.displayfeature_aidl-service.rc"],
+    vintf_fragments: ["vendor.xiaomi.hardware.displayfeature_aidl-service.xml"],
+    shared_libs: ["libbinder_ndk", "liblog"],
+}

@@ -1,0 +1,5 @@
+service vendor.displayfeatureaidl-hal-rust /vendor/bin/hw/vendor.xiaomi.hardware.displayfeature_aidl-service.tb375fc-rust
+    class hal
+    user system
+    group system graphics
+    interface aidl vendor.xiaomi.hardware.displayfeature_aidl.IDisplayFeature/default

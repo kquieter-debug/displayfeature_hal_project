@@ -1,0 +1,4 @@
+filegroup {
+    name: "tb375fc_displayfeature_aidl_contract",
+    srcs: ["aidl/vendor/xiaomi/hardware/displayfeature_aidl/*.aidl"],
+}

@@ -1,0 +1,10 @@
+[package]
+name = "tb375fc-display-compat"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+

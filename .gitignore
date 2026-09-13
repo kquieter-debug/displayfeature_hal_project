@@ -1,0 +1,6 @@
+target/
+obj/
+libs/
+*.log
+*.exe
+rust/artifacts
