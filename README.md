@@ -1,6 +1,6 @@
 # DisplayFeature HAL Compatibility Project
 
-Standalone Rust Android DisplayFeature HAL for the TB375FC HyperOS4 port.
+AI DID THIS
 
 ## Layout
 
