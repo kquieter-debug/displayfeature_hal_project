@@ -81,6 +81,7 @@ impl State {
             }
             ColorLevel::LegacyTemperature(temperature) => {
                 self.temperature = temperature;
+                self.color_gains = None;
                 true
             }
             ColorLevel::Invalid => false,
@@ -165,6 +166,7 @@ mod tests {
         let mut state = State::default();
         assert!(state.update(0, 3));
         assert_eq!(state.temperature, 3);
+        assert_eq!(state.color_gains, None);
         assert!(state.update(3, 20));
         assert_eq!(state.eye, 50);
         assert!(state.update(3, 0));
@@ -172,16 +174,56 @@ mod tests {
     }
 
     #[test]
-    fn color_gain_combines_with_temperature_and_eye_matrix() {
+    fn color_ball_override_is_replaced_by_temperature_presets() {
         let mut state = State::default();
-        state.update(1, 0xff80_4020u32 as i32);
-        state.update(23, 1);
+        assert!(state.update(2, 0xff80_4020u32 as i32));
+        assert_eq!(state.color_gains, Some([1.0, 0.5, 0.25]));
+
+        assert!(state.update(2, 1));
+        assert_eq!(state.temperature, 1);
+        assert_eq!(state.color_gains, None);
+        let (warm_matrix, _) = state.render();
+        assert_eq!(warm_matrix[0], 1.0);
+        assert_eq!(warm_matrix[5], 0.925);
+        assert_eq!(warm_matrix[10], 0.84);
+
+        assert!(state.update(2, 3));
+        assert_eq!(state.temperature, 3);
+        assert_eq!(state.color_gains, None);
+        let (cool_matrix, _) = state.render();
+        assert_eq!(cool_matrix[0], 0.88);
+        assert_eq!(cool_matrix[5], 0.95);
+        assert_eq!(cool_matrix[10], 1.0);
+
+        assert!(state.update(2, 2));
+        assert_eq!(state.temperature, 2);
+        assert_eq!(state.color_gains, None);
+        let (default_matrix, _) = state.render();
+        assert_eq!(default_matrix[0], 1.0);
+        assert_eq!(default_matrix[5], 1.0);
+        assert_eq!(default_matrix[10], 1.0);
+    }
+
+    #[test]
+    fn replayed_argb_keeps_color_ball_override() {
+        let mut state = State::default();
+        assert!(state.update(2, 0xff80_4020u32 as i32));
+        assert_eq!(state.color_gains, Some([1.0, 0.5, 0.25]));
+        let (matrix, _) = state.render();
+        assert_eq!(matrix[5], 0.5);
+        assert_eq!(matrix[10], 0.25);
+    }
+
+    #[test]
+    fn color_gain_combines_with_eye_matrix() {
+        let mut state = State::default();
+        state.update(2, 0xff80_4020u32 as i32);
         state.update(3, 255);
         let (matrix, saturation) = state.render();
         assert_eq!(matrix[0], 1.0);
-        assert!((matrix[5] - 0.5 * 0.925 * (1.0 - 30.0 / 255.0)).abs() < 0.00001);
-        assert!((matrix[10] - 0.25 * 0.84 * (1.0 - 115.0 / 255.0)).abs() < 0.00001);
-        assert_eq!(saturation, 1.2);
+        assert!((matrix[5] - 0.5 * (1.0 - 30.0 / 255.0)).abs() < 0.00001);
+        assert!((matrix[10] - 0.25 * (1.0 - 115.0 / 255.0)).abs() < 0.00001);
+        assert_eq!(saturation, 1.3);
     }
 
     #[test]
