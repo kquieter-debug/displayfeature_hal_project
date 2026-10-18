@@ -1,5 +1,7 @@
 #![allow(non_camel_case_types)]
 
+mod hdr_controller;
+
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
@@ -133,10 +135,18 @@ unsafe extern "C" fn transact(b: *mut AIBinder, code: code_t, input: *const APar
         if !cb.is_null() { AIBinder_decStrong(cb); }
         return write_ok(output);
     }
+    if code == 1 {
+        // oneway notifyBrightness(int): record for HDR diagnostics, reply unused.
+        let mut v = 0;
+        if AParcel_readInt32(input, &mut v) != OK { return BAD_VALUE; }
+        hdr_controller::on_brightness(v);
+        return write_ok(output);
+    }
     if code != SET_FEATURE { return UNKNOWN; }
     let mut a = [0i32; 4];
     for x in &mut a { if AParcel_readInt32(input, x) != OK { return BAD_VALUE; } }
     if a[0] != 0 { return write_ok(output); }
+    hdr_controller::on_set_feature(a[1], a[2], a[3]);
     if let Ok(mut state) = STATE.get_or_init(|| Mutex::new(State { style: 0, temperature: 2, eye: 0 })).lock() {
         match a[1] {
             0 | 1 | 2 => { state.style = a[1]; if (1..=3).contains(&a[2]) { state.temperature = a[2]; } }
@@ -163,8 +173,9 @@ fn main() {
         if binder.is_null() { log(b"binder creation failed\0"); std::process::exit(1); }
         let status = AServiceManager_addService(binder, NAME.as_ptr() as _);
         if status != OK { log_status(b"service registration\0", status); AIBinder_decStrong(binder); std::process::exit(1); }
-        log(b"registered\0");
-        ABinderProcess_joinThreadPool();
+    log(b"registered\0");
+    hdr_controller::start();
+    ABinderProcess_joinThreadPool();
     }
 }
 
