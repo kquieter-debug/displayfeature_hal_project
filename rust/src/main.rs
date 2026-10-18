@@ -1,7 +1,9 @@
 #![allow(non_camel_case_types)]
 
+mod color;
 mod hdr_controller;
 
+use color::State;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
@@ -57,8 +59,6 @@ static SF_DESC: &[u8] = b"android.ui.ISurfaceComposer\0";
 static TAG: &[u8] = b"TB375FCDisplayCompatRust\0";
 static HASH_VALUE: &[u8] = b"e57e364757bc7b63a3a7e586585c5827115966d7\0";
 
-#[derive(Clone, Copy)]
-struct State { style: i32, temperature: i32, eye: i32 }
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
 unsafe fn log(msg: &'static [u8]) { __android_log_print(4, TAG.as_ptr() as _, msg.as_ptr() as _); }
@@ -78,33 +78,13 @@ unsafe extern "C" fn remote_create(_: *mut c_void) -> *mut c_void { ptr::null_mu
 unsafe extern "C" fn remote_destroy(_: *mut c_void) {}
 unsafe extern "C" fn remote_tx(_: *mut AIBinder, _: code_t, _: *const AParcel, _: *mut AParcel) -> status_t { UNKNOWN }
 
-fn identity() -> [f32; 16] { [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0] }
-fn render(s: State) -> ([f32; 16], f32) {
-    let mut m = identity();
-    let mut g = 1.0f32;
-    let mut b = 1.0f32;
-    if s.eye > 0 {
-        let f = ((s.eye.clamp(50, 255) - 50) as f32) / 205.0;
-        g = 1.0 - (5.0 + f * 25.0) / 255.0;
-        b = 1.0 - (20.0 + f * 95.0) / 255.0;
-    }
-    let (r_style, g_style, b_style) = match s.temperature {
-        1 => (1.0, 0.925, 0.84),
-        3 => (0.88, 0.95, 1.0),
-        _ => (1.0, 1.0, 1.0),
-    };
-    m[0] = r_style; m[5] = g_style * g; m[10] = b_style * b;
-    let sat = match s.style { 1 => 1.2, 2 => 1.3, _ => 1.0 };
-    (m, sat)
-}
-
 unsafe fn apply(s: State) {
     let sf = AServiceManager_getService(SF_NAME.as_ptr() as _);
     if sf.is_null() { log(b"SurfaceFlinger unavailable\0"); return; }
     let class = AIBinder_Class_define(SF_DESC.as_ptr() as _, Some(remote_create), Some(remote_destroy), Some(remote_tx));
     if class.is_null() { AIBinder_decStrong(sf); return; }
     let _ = AIBinder_associateClass(sf, class);
-    let (matrix, saturation) = render(s);
+    let (matrix, saturation) = s.render();
     let mut input = ptr::null_mut();
     let mut output = ptr::null_mut();
     let mut status = AIBinder_prepareTransaction(sf, &mut input);
@@ -140,25 +120,20 @@ unsafe extern "C" fn transact(b: *mut AIBinder, code: code_t, input: *const APar
         let mut v = 0;
         if AParcel_readInt32(input, &mut v) != OK { return BAD_VALUE; }
         hdr_controller::on_brightness(v);
-        return write_ok(output);
+        return OK;
     }
     if code != SET_FEATURE { return UNKNOWN; }
     let mut a = [0i32; 4];
     for x in &mut a { if AParcel_readInt32(input, x) != OK { return BAD_VALUE; } }
     if a[0] != 0 { return write_ok(output); }
     hdr_controller::on_set_feature(a[1], a[2], a[3]);
-    if let Ok(mut state) = STATE.get_or_init(|| Mutex::new(State { style: 0, temperature: 2, eye: 0 })).lock() {
-        match a[1] {
-            0 | 1 | 2 => { state.style = a[1]; if (1..=3).contains(&a[2]) { state.temperature = a[2]; } }
-            3 => { state.eye = if a[2] <= 0 { 0 } else { a[2].clamp(50, 255) }; }
-            23 => { if a[2] == 1 { state.temperature = 1; } else if a[2] == 2 { state.temperature = 2; } else if a[2] == 3 { state.temperature = 3; } }
-            _ => {}
+    if let Ok(mut state) = STATE.get_or_init(|| Mutex::new(State::default())).lock() {
+        if state.update(a[1], a[2]) {
+            apply(*state);
         }
-        let snapshot = *state;
-        apply(snapshot);
-        let fmt = b"setFeature display=%d mode=%d value=%d cookie=%d\0";
-        __android_log_print(4, TAG.as_ptr() as _, fmt.as_ptr() as _, a[0], a[1], a[2], a[3]);
     }
+    let fmt = b"setFeature display=%d mode=%d value=%d cookie=%d\0";
+    __android_log_print(4, TAG.as_ptr() as _, fmt.as_ptr() as _, a[0], a[1], a[2], a[3]);
     write_ok(output)
 }
 
@@ -166,7 +141,7 @@ fn main() {
     unsafe {
         ABinderProcess_setThreadPoolMaxThreadCount(2);
         ABinderProcess_startThreadPool();
-        let state = Box::new(State { style: 0, temperature: 2, eye: 0 });
+        let state = Box::new(State::default());
         let class = AIBinder_Class_define(DESC.as_ptr() as _, Some(create), Some(destroy), Some(transact));
         if class.is_null() { log(b"class creation failed\0"); std::process::exit(1); }
         let binder = AIBinder_new(class, Box::into_raw(state) as _);
