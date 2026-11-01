@@ -2,11 +2,14 @@
 
 mod color;
 mod hdr_controller;
+mod state_store;
 
 use color::State;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 #[repr(C)] struct AIBinder(c_void);
 #[repr(C)] struct AIBinder_Class(c_void);
@@ -78,11 +81,16 @@ unsafe extern "C" fn remote_create(_: *mut c_void) -> *mut c_void { ptr::null_mu
 unsafe extern "C" fn remote_destroy(_: *mut c_void) {}
 unsafe extern "C" fn remote_tx(_: *mut AIBinder, _: code_t, _: *const AParcel, _: *mut AParcel) -> status_t { UNKNOWN }
 
-unsafe fn apply(s: State) {
-    let sf = AServiceManager_getService(SF_NAME.as_ptr() as _);
-    if sf.is_null() { log(b"SurfaceFlinger unavailable\0"); return; }
+static RETRYING: AtomicBool = AtomicBool::new(false);
+
+unsafe fn sf_binder() -> *mut AIBinder {
+    AServiceManager_getService(SF_NAME.as_ptr() as _)
+}
+
+/// Applies the color state to an already-resolved SurfaceFlinger binder.
+unsafe fn apply_with(sf: *mut AIBinder, s: State) -> bool {
     let class = AIBinder_Class_define(SF_DESC.as_ptr() as _, Some(remote_create), Some(remote_destroy), Some(remote_tx));
-    if class.is_null() { AIBinder_decStrong(sf); return; }
+    if class.is_null() { return false; }
     let _ = AIBinder_associateClass(sf, class);
     let (matrix, saturation) = s.render();
     let mut input = ptr::null_mut();
@@ -103,7 +111,82 @@ unsafe fn apply(s: State) {
         if !input.is_null() { AParcel_delete(input); }
         log_status(b"SurfaceFlinger saturation\0", status);
     }
+    status == OK
+}
+
+unsafe fn apply(s: State) -> bool {
+    let sf = sf_binder();
+    if sf.is_null() { log(b"SurfaceFlinger unavailable\0"); return false; }
+    let ok = apply_with(sf, s);
     AIBinder_decStrong(sf);
+    ok
+}
+
+/// Applies now, or retries in the background until SurfaceFlinger is registered.
+/// Catches early setFeature calls that arrive before SurfaceFlinger is up.
+fn apply_or_retry(s: State) {
+    unsafe { if apply(s) { return; } }
+    if RETRYING.swap(true, Ordering::SeqCst) { return; }
+    std::thread::spawn(move || {
+        unsafe {
+            for _ in 0..300 {
+                let sf = sf_binder();
+                if !sf.is_null() {
+                    let ok = apply_with(sf, s);
+                    AIBinder_decStrong(sf);
+                    if ok { break; }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        RETRYING.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Restores the persisted state as soon as SurfaceFlinger accepts transactions,
+/// then keeps re-applying once a second while the boot pipeline settles.
+/// Skipped if the client already pushed newer values.
+fn boot_restore(saved: State) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut applied = false;
+    while std::time::Instant::now() < deadline {
+        unsafe {
+            let sf = sf_binder();
+            if !sf.is_null() {
+                let ok = apply_with(sf, saved);
+                AIBinder_decStrong(sf);
+                if ok {
+                    applied = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if applied { unsafe { log(b"boot restore applied\0") }; }
+
+    // SurfaceFlinger / the display pipeline can reset the transform while the
+    // system boots. Re-apply once a second during the first 45 seconds so the
+    // window where the wrong color is visible is at most ~1s. Stop as soon as
+    // the client pushes different values.
+    let settle = std::time::Instant::now() + Duration::from_secs(45);
+    while std::time::Instant::now() < settle {
+        std::thread::sleep(Duration::from_millis(1000));
+        let still_saved = match STATE.get().and_then(|m| m.lock().ok().map(|g| *g == saved)) {
+            Some(v) => v,
+            None => true,
+        };
+        if !still_saved {
+            break;
+        }
+        unsafe {
+            let sf = sf_binder();
+            if !sf.is_null() {
+                let _ = apply_with(sf, saved);
+                AIBinder_decStrong(sf);
+            }
+        }
+    }
 }
 
 unsafe extern "C" fn transact(b: *mut AIBinder, code: code_t, input: *const AParcel, output: *mut AParcel) -> status_t {
@@ -127,10 +210,20 @@ unsafe extern "C" fn transact(b: *mut AIBinder, code: code_t, input: *const APar
     for x in &mut a { if AParcel_readInt32(input, x) != OK { return BAD_VALUE; } }
     if a[0] != 0 { return write_ok(output); }
     hdr_controller::on_set_feature(a[1], a[2], a[3]);
-    if let Ok(mut state) = STATE.get_or_init(|| Mutex::new(State::default())).lock() {
-        if state.update(a[1], a[2]) {
-            apply(*state);
+    let updated = match STATE.get_or_init(|| Mutex::new(State::default())).lock() {
+        Ok(mut state) => {
+            if state.update(a[1], a[2]) {
+                let snapshot = *state;
+                state_store::save(&snapshot);
+                Some(snapshot)
+            } else {
+                None
+            }
         }
+        Err(_) => None,
+    };
+    if let Some(snapshot) = updated {
+        apply_or_retry(snapshot);
     }
     let fmt = b"setFeature display=%d mode=%d value=%d cookie=%d\0";
     __android_log_print(4, TAG.as_ptr() as _, fmt.as_ptr() as _, a[0], a[1], a[2], a[3]);
@@ -141,16 +234,28 @@ fn main() {
     unsafe {
         ABinderProcess_setThreadPoolMaxThreadCount(2);
         ABinderProcess_startThreadPool();
-        let state = Box::new(State::default());
+        let saved = state_store::load();
+        let initial = saved.unwrap_or_default();
+        let _ = STATE.set(Mutex::new(initial));
+        let state = Box::new(initial);
         let class = AIBinder_Class_define(DESC.as_ptr() as _, Some(create), Some(destroy), Some(transact));
         if class.is_null() { log(b"class creation failed\0"); std::process::exit(1); }
         let binder = AIBinder_new(class, Box::into_raw(state) as _);
         if binder.is_null() { log(b"binder creation failed\0"); std::process::exit(1); }
-        let status = AServiceManager_addService(binder, NAME.as_ptr() as _);
+        // Started from post-fs-data now, so servicemanager may still be settling.
+        let mut status = -1;
+        for _ in 0..50 {
+            status = AServiceManager_addService(binder, NAME.as_ptr() as _);
+            if status == OK { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         if status != OK { log_status(b"service registration\0", status); AIBinder_decStrong(binder); std::process::exit(1); }
-    log(b"registered\0");
-    hdr_controller::start();
-    ABinderProcess_joinThreadPool();
+        log(b"registered\0");
+        if let Some(saved_state) = saved {
+            std::thread::spawn(move || boot_restore(saved_state));
+        }
+        hdr_controller::start();
+        ABinderProcess_joinThreadPool();
     }
 }
 

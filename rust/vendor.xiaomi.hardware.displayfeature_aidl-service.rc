@@ -1,5 +1,10 @@
-service vendor.displayfeatureaidl-hal-rust /vendor/bin/hw/vendor.xiaomi.hardware.displayfeature_aidl-service.tb375fc-rust
-    class hal
+service vendor.displayfeatureaidl-hal-rust /vendor/bin/hw/vendor.xiaomi.hardware.displayfeature_aidl-service
+    class core animation
     user system
     group system graphics
-    interface aidl vendor.xiaomi.hardware.displayfeature_aidl.IDisplayFeature/default
+
+# Start from post-fs-data so the SurfaceFlinger wait begins before late-init;
+# the HAL restores the persisted color state as soon as SF accepts it.
+on post-fs-data
+    mkdir /data/vendor/displayfeature 0770 system graphics
+    start vendor.displayfeatureaidl-hal-rust
